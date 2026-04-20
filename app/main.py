@@ -1,139 +1,99 @@
 """
-MediChat - FINAL main.py (with memory)
+MediChat - main.py
+------------------
+FastAPI backend with:
+- ML prediction
+- Red flag detection
+- LLM integration
+- Conversation memory
 """
 
 from fastapi import FastAPI
 from pydantic import BaseModel
 import pickle
-import os
-
-# ── Paths ─────────────────────────────────────────────
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-MODEL_PATH = os.path.join(BASE_DIR, "models/model.pkl")
-VECTORIZER_PATH = os.path.join(BASE_DIR, "models/vectorizer.pkl")
-
-# ── Load ML ───────────────────────────────────────────
-model = pickle.load(open(MODEL_PATH, "rb"))
-vectorizer = pickle.load(open(VECTORIZER_PATH, "rb"))
 
 from src.symptom_normalizer import normalize_input
 from src.llm import call_gemini_multi
+from src.utils import check_red_flags, get_severity
 
-# ── FastAPI ───────────────────────────────────────────
-app = FastAPI(title="MediChat API")
+app = FastAPI()
 
-# ── Request Models ────────────────────────────────────
+# ── Load model + vectorizer ───────────────────────────────
+
+with open("models/model.pkl", "rb") as f:
+    model = pickle.load(f)
+
+with open("models/vectorizer.pkl", "rb") as f:
+    vectorizer = pickle.load(f)
+
+
+# ── Request schema ────────────────────────────────────────
+
 class ChatRequest(BaseModel):
     message: str
-    history: list = []   # ✅ conversation memory
+    history: list[str] = []
 
-# ── Severity ──────────────────────────────────────────
-def get_severity(user_input: str, confidence: float) -> str:
-    text = user_input.lower()
 
-    severe_keywords = [
-        "severe", "extreme", "unbearable",
-        "can't breathe", "chest pain", "blood",
-        "fainting", "collapse"
-    ]
+# ── Summary endpoint ──────────────────────────────────────
 
-    moderate_keywords = [
-        "pain", "fever", "vomiting", "persistent",
-        "high", "bad", "worse"
-    ]
+@app.post("/summary")
+def get_summary(req: ChatRequest):
+    from llm import call_gemini_multi
 
-    if any(word in text for word in severe_keywords):
-        return "Severe"
-
-    if any(word in text for word in moderate_keywords):
-        return "Moderate"
-
-    if confidence > 85:
-        return "Moderate"
-    elif confidence > 60:
-        return "Mild"
-    else:
-        return "Mild"
-
-# ── Guidance ──────────────────────────────────────────
-def get_guidance(category: str):
-    guidance_map = {
-        "Respiratory": {
-            "advice": "Rest, stay hydrated, and monitor breathing.",
-            "doctor": "Consult a doctor if breathing difficulty persists."
-        },
-        "Digestive": {
-            "advice": "Eat light food and stay hydrated.",
-            "doctor": "See a doctor if vomiting or pain worsens."
-        },
-        "Mental": {
-            "advice": "Rest and manage stress.",
-            "doctor": "Seek help if symptoms persist."
-        },
-        "Musculoskeletal": {
-            "advice": "Rest the affected area.",
-            "doctor": "Consult a doctor if pain continues."
-        },
-        "Skin": {
-            "advice": "Keep area clean and avoid scratching.",
-            "doctor": "See a doctor if spreading."
-        },
-        "General": {
-            "advice": "Rest and stay hydrated.",
-            "doctor": "Consult a doctor if symptoms worsen."
-        }
+    summary_prompt = {
+        "category": "General",
+        "severity": "Mild"
     }
 
-    return guidance_map.get(category, guidance_map["General"])
-
-# ── Fallback ──────────────────────────────────────────
-def generate_fallback(prediction: dict) -> str:
-    return (
-        f"{prediction['category']} issue with {prediction['severity']} severity. "
-        f"{prediction['advice']}"
+    reply = call_gemini_multi(
+        "Summarize this conversation briefly:\n" + "\n".join(req.history),
+        summary_prompt,
+        req.history
     )
 
-# ── ROOT ──────────────────────────────────────────────
-@app.get("/")
-def home():
-    return {"message": "MediChat API running 🚀"}
+    return {"summary": reply}
 
-# ── CHAT ──────────────────────────────────────────────
+
+# ── Main chat endpoint ────────────────────────────────────
+
 @app.post("/chat")
-def chat(request: ChatRequest):
-    user_input = request.message
+def chat(req: ChatRequest):
 
-    # ── ML prediction ─────────────────────────────
+    user_input = req.message
+
+    # 🚨 Red flag override
+    if check_red_flags(user_input):
+        return {
+            "reply": "⚠️ This may be a serious condition. Please seek immediate medical attention.",
+            "category": "Emergency",
+            "severity": "Severe",
+            "confidence": 100.0,
+        }
+
+    # ── Normalize input ────────────────────────────────
     norm = normalize_input(user_input)
+
+    # ── ML prediction ─────────────────────────────────
     vec = vectorizer.transform([norm])
-
     pred = model.predict(vec)[0]
-    prob = model.predict_proba(vec).max() * 100
+    proba = model.predict_proba(vec)[0].max() * 100
 
-    severity = get_severity(user_input, prob)
-    guidance = get_guidance(pred)
+    severity = get_severity(proba)
 
     prediction = {
         "category": pred,
-        "severity": severity,
-        "confidence": round(prob, 2),
-        "advice": guidance["advice"]
+        "severity": severity
     }
 
-    # ── conversation history ─────────────────────
-    history_text = "\n".join(request.history)
+    # ── LLM call ──────────────────────────────────────
+    reply = call_gemini_multi(user_input, prediction, req.history)
 
-    # ── LLM call ────────────────────────────────
-    reply = call_gemini_multi(user_input, prediction, history_text)
-
-    # ── fallback ────────────────────────────────
     if not reply:
-        reply = generate_fallback(prediction)
+        reply = "Please rest, stay hydrated, and monitor your symptoms."
 
     return {
         "reply": reply,
         "category": pred,
         "severity": severity,
-        "confidence": round(prob, 2)
+        "confidence": round(float(proba), 2),
     }
